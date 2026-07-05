@@ -194,6 +194,38 @@ def start_pms():
     subprocess.run(["open", "-g", "-a", "Plex Media Server"], capture_output=True)
 
 
+def wait_for_server(timeout=60):
+    for _ in range(timeout):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:32400/identity", timeout=2):
+                return True
+        except Exception:
+            time.sleep(1)
+    return False
+
+
+def nudge_clients(section_ids):
+    """Kick a scan on each section so the server broadcasts change events.
+
+    All row changes happen while Plex is stopped, so clients never hear about
+    restored libraries and keep their cached sidebars until something wakes
+    them. A scan of an unchanged library is cheap and fires those events."""
+    token = plex_token()
+    if not token or not wait_for_server():
+        return 0
+    n = 0
+    for sid in section_ids:
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:32400/library/sections/{sid}/refresh?X-Plex-Token={token}"
+            )
+            with urllib.request.urlopen(req, timeout=10):
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
 # ---------------------------------------------------------------- backups
 
 def backup_db():
@@ -489,6 +521,9 @@ def restore(cfg, force=False):
     print(
         f"restored: {', '.join(name for _, name, _ in hidden)} ({n} artwork bundles back)"
     )
+    if was_running:
+        nudged = nudge_clients([sid for sid, _, _ in hidden])
+        print(f"triggered scans on {nudged} restored libraries so clients refresh")
 
 
 # ---------------------------------------------------------------- selection
