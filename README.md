@@ -193,12 +193,13 @@ database untouched). Everything runs against temp copies with
 ## Caveats
 
 - Plex TV apps cache the sidebar, and all row changes happen while the
-  server is stopped, so clients never receive change events for them. After
-  a restore, the tool automatically triggers a scan on each restored library
-  (cheap: nothing on disk changed), which fires the events that make clients
-  refresh. Hidden libraries lingering as empty shells clear on the next app
-  refresh; force-quit and relaunch the TV app to clear them immediately.
-  For guests, hide before the TV app is opened.
+  server is stopped, so clients never receive change events for them. The
+  tool compensates after every toggle: on restore it triggers a scan on
+  each restored library (cheap: nothing on disk changed), and after both
+  hide and restore it renames a surviving library and immediately renames
+  it back, which fires the section-change events that make connected
+  clients re-fetch the library list. A client that is fully asleep during
+  the toggle picks up the change when it next connects.
 - Each toggle restarts Plex Media Server (a few seconds). The tool refuses
   to run while anyone is actively streaming; override with `--force`.
 - Play queues referencing hidden items are dropped (Plex regenerates them).

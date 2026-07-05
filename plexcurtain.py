@@ -204,6 +204,42 @@ def wait_for_server(timeout=60):
     return False
 
 
+def poke_clients():
+    """Force connected clients to re-fetch the library list.
+
+    There is no purge-cache command for Plex clients, but they re-pull the
+    section list on section-change events. Renaming a surviving library and
+    immediately renaming it back fires two such events with no other effect."""
+    token = plex_token()
+    if not token or not wait_for_server():
+        return False
+    try:
+        import urllib.parse
+        import xml.etree.ElementTree as ET
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:32400/library/sections?X-Plex-Token={token}"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            root = ET.fromstring(resp.read())
+        d = next(iter(root.iter("Directory")), None)
+        if d is None:
+            return False
+        key, agent, title = d.get("key"), d.get("agent"), d.get("title")
+        for name in (title + ".", title):
+            q = urllib.parse.quote(name)
+            put = urllib.request.Request(
+                f"http://127.0.0.1:32400/library/sections/{key}"
+                f"?agent={agent}&name={q}&X-Plex-Token={token}",
+                method="PUT",
+            )
+            with urllib.request.urlopen(put, timeout=10):
+                pass
+        return True
+    except Exception:
+        return False
+
+
 def nudge_clients(section_ids):
     """Kick a scan on each section so the server broadcasts change events.
 
@@ -401,6 +437,8 @@ CREATE TEMP TABLE mv_clusters AS SELECT id FROM metadata_item_clusters WHERE lib
         f"hidden: {', '.join(name for _, name in found)} "
         f"({len(moved)} artwork bundles atticked, {missing_bundles} had none)"
     )
+    if was_running and poke_clients():
+        print("poked clients to re-fetch the library list")
 
 
 # ---------------------------------------------------------------- bundles
@@ -524,6 +562,8 @@ def restore(cfg, force=False):
     if was_running:
         nudged = nudge_clients([sid for sid, _, _ in hidden])
         print(f"triggered scans on {nudged} restored libraries so clients refresh")
+        if poke_clients():
+            print("poked clients to re-fetch the library list")
 
 
 # ---------------------------------------------------------------- selection
