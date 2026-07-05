@@ -192,6 +192,11 @@ database untouched). Everything runs against temp copies with
 
 ## Caveats
 
+- Plex TV apps cache the sidebar. If the app was open (or suspended) during
+  a toggle, it may keep showing empty shells of hidden libraries until it
+  refreshes. Force-quit and relaunch the app to clear them immediately; the
+  server itself returns no trace of hidden libraries. For guests, hide
+  before the TV app is opened.
 - Each toggle restarts Plex Media Server (a few seconds). The tool refuses
   to run while anyone is actively streaming; override with `--force`.
 - Play queues referencing hidden items are dropped (Plex regenerates them).
