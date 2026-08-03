@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
@@ -157,6 +158,17 @@ def plex_token():
         return None
 
 
+def count_playing(body):
+    """Sessions in a /status/sessions payload that are demonstrably playing
+    (or buffering). Anything else (paused, stopped, unknown state) doesn't
+    count: a device someone walked away from shouldn't block a toggle, and
+    Plex keeps the resume point."""
+    root = ET.fromstring(body)
+    return sum(
+        1 for p in root.iter("Player") if p.get("state") in ("playing", "buffering")
+    )
+
+
 def active_sessions():
     token = plex_token()
     if not token:
@@ -166,13 +178,9 @@ def active_sessions():
             f"http://127.0.0.1:32400/status/sessions?X-Plex-Token={token}"
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            body = resp.read().decode()
-        for part in body.split():
-            if part.startswith('size="'):
-                return int(part.split('"')[1])
+            return count_playing(resp.read())
     except Exception:
         return 0
-    return 0
 
 
 def stop_pms():
@@ -215,7 +223,6 @@ def poke_clients():
         return False
     try:
         import urllib.parse
-        import xml.etree.ElementTree as ET
 
         req = urllib.request.Request(
             f"http://127.0.0.1:32400/library/sections?X-Plex-Token={token}"
@@ -301,8 +308,6 @@ def server_sections():
     token = plex_token()
     if token and not NO_SERVER:
         try:
-            import xml.etree.ElementTree as ET
-
             req = urllib.request.Request(
                 f"http://127.0.0.1:32400/library/sections?X-Plex-Token={token}"
             )
@@ -342,7 +347,7 @@ def hide(cfg, force=False):
     if pms_running() and not force:
         n = active_sessions()
         if n:
-            die(f"{n} active stream(s) on the server; retry with --force to interrupt them")
+            die(f"{n} stream(s) actively playing; retry with --force to interrupt them")
 
     names = cfg["sections"]
     quoted = ",".join("'" + n.replace("'", "''") + "'" for n in names)
@@ -508,7 +513,7 @@ def restore(cfg, force=False):
     if pms_running() and not force:
         n = active_sessions()
         if n:
-            die(f"{n} active stream(s) on the server; retry with --force to interrupt them")
+            die(f"{n} stream(s) actively playing; retry with --force to interrupt them")
 
     was_running = stop_pms()
     backup = backup_db()

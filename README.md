@@ -202,6 +202,10 @@ database untouched). Everything runs against temp copies with
   the toggle picks up the change when it next connects.
 - Each toggle restarts Plex Media Server (a few seconds). The tool refuses
   to run while anyone is actively streaming; override with `--force`.
+  Only sessions that are actually playing or buffering block; paused or
+  stopped ones do not, since a device someone walked away from mid-video
+  would otherwise wedge the toggle indefinitely, and Plex keeps the resume
+  point across the restart.
 - Play queues referencing hidden items are dropped (Plex regenerates them).
   Playlist *membership* is preserved.
 - Avoid letting Plex upgrade itself while libraries are hidden: if a server

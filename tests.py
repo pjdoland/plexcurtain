@@ -23,7 +23,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import plexcurtain  # sibling module; sys.path[0] is this script's directory
 
 REPO = Path(__file__).resolve().parent
 TOOL = REPO / "plexcurtain.py"
@@ -395,6 +398,36 @@ class PlexcurtainTests(unittest.TestCase):
         psql(self.db, "ALTER TABLE metadata_items ADD COLUMN curtain_test_col INTEGER;")
         self.run_tool("restore")
         self.assertEqual(before, one(self.db, "SELECT count(*) FROM metadata_items"))
+
+
+class SessionCountTests(unittest.TestCase):
+    """count_playing() decides which sessions block a toggle (no server needed)."""
+
+    def container(self, *states):
+        videos = "".join(f'<Video><Player state="{s}"/></Video>' for s in states)
+        return f'<MediaContainer size="{len(states)}">{videos}</MediaContainer>'
+
+    def test_empty_container_counts_zero(self):
+        self.assertEqual(plexcurtain.count_playing(self.container()), 0)
+
+    def test_paused_sessions_do_not_count(self):
+        self.assertEqual(plexcurtain.count_playing(self.container("paused", "paused")), 0)
+
+    def test_stopped_and_unknown_states_do_not_count(self):
+        self.assertEqual(plexcurtain.count_playing(self.container("stopped", "weird")), 0)
+
+    def test_stateless_player_does_not_count(self):
+        xml = '<MediaContainer size="1"><Video><Player/></Video></MediaContainer>'
+        self.assertEqual(plexcurtain.count_playing(xml), 0)
+
+    def test_playing_and_buffering_count(self):
+        self.assertEqual(
+            plexcurtain.count_playing(self.container("playing", "buffering", "paused")), 2
+        )
+
+    def test_malformed_xml_raises_parse_error_for_caller_to_swallow(self):
+        with self.assertRaises(ET.ParseError):
+            plexcurtain.count_playing("not xml")
 
 
 if __name__ == "__main__":
