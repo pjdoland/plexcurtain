@@ -216,3 +216,7 @@ database untouched). Everything runs against temp copies with
 - Watch states live in `metadata_item_settings`, keyed by GUID; they are
   intentionally left in place while hidden (they render nowhere) and relink
   automatically on restore.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
