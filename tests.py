@@ -290,6 +290,25 @@ class PlexcurtainTests(unittest.TestCase):
         out = self.run_tool("status").stdout
         self.assertIn("all libraries visible", out)
 
+    def test_hidden_titles_leave_the_search_index(self):
+        """The README claims hidden titles stop being searchable; prove it.
+
+        Plex's FTS triggers fire on the DELETE from metadata_items, so the
+        titles leave fts4_metadata_titles and come back on restore. This is
+        what separates moving the rows from merely re-flagging a library."""
+        ids = ",".join(r[0] for r in rows(
+            self.db, "SELECT mi.id FROM metadata_items mi JOIN library_sections ls "
+                     f"ON ls.id = mi.library_section_id WHERE ls.name IN ('{ALPHA}', '{BETA}');"))
+        indexed = f"SELECT count(*) FROM fts4_metadata_titles WHERE docid IN ({ids});"
+        before = one(self.db, indexed)
+        self.assertNotEqual(before, "0", "fixture titles must start out indexed")
+        self.run_tool("hide")
+        self.assertEqual(one(self.db, indexed), "0",
+                         "a hidden title must not stay in the search index")
+        self.run_tool("restore")
+        self.assertEqual(one(self.db, indexed), before,
+                         "restore must put the titles back in the index")
+
     def test_hide_moves_only_target_sections(self):
         # a real Plex DB has legit section-less items (playlists, collections);
         # what must not change is the number of *orphans* — items pointing at a
