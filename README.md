@@ -150,6 +150,14 @@ open eye = everything visible, slashed eye = hidden.
   records or half-restore a library.
 - Changing the selection while hidden simply marks intent; `apply` (or the
   menubar item) reconciles it via a full restore followed by a fresh hide.
+- **Extras travel with their library.** Featurettes, interviews, and fetched
+  trailers are stored with no `library_section_id` of their own, linked to
+  their movie through `metadata_relations`, so a section-only sweep would
+  strand their rows and artwork. Hide claims the extras reachable *only*
+  from items it is moving. An extra that a library still on screen also
+  points at is left alone, so hiding one library can never strip a trailer
+  from another; an extra whose owner link is missing entirely cannot be
+  attributed to any library and stays put by design.
 
 Config lives outside the repo at
 `~/Library/Application Support/Plexcurtain/config.json`:
@@ -170,7 +178,8 @@ python3 tests.py -v
 The suite builds a synthetic fixture by copying the local Plex database and
 cloning rows into fake libraries ("Curtain Test Alpha/Beta"), then exercises
 hide/restore round trips (asserting byte-identical content), bundle moves,
-watch-state survival, ID-collision safety for rows added while hidden,
+watch-state survival, extras travelling with (or staying behind from)
+their owners, ID-collision safety for rows added while hidden,
 tag resurrection after garbage collection, selection drift + apply,
 guard rails (empty selection, double hide, missing library), simulated
 schema migration, and failure injection (a failed hide must leave the

@@ -2,7 +2,8 @@
 """plexcurtain — atomically hide/restore Plex libraries by moving their DB records to an attic.
 
 Hide:    stop Plex, back up the library DB, move every row belonging to the
-         configured sections (plus their on-disk artwork bundles) into
+         configured sections — plus the section-less extras only they own and
+         all their on-disk artwork bundles — into
          ~/Library/Application Support/Plexcurtain/attic.db, restart Plex.
 Restore: the exact inverse. Nothing is rescanned, so all metadata survives:
          watch states, custom posters, edits, added-dates, collections.
@@ -22,6 +23,7 @@ restoring everything and re-hiding the new set.
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -55,8 +57,8 @@ CONFIG = DATA / "config.json"
 DEFAULT_CONFIG = {"sections": [], "keep_backups": 3}
 
 # Tables moved wholesale, with the WHERE clause selecting a hidden section's rows.
-# Temp tables mv_sections/mv_items/mv_media/mv_parts/mv_streams/mv_clusters are
-# built first (see hide()).
+# Temp tables mv_sections/mv_items/mv_extras/mv_media/mv_parts/mv_streams/mv_clusters
+# are built first (see hide()); mv_items includes the claimed extras.
 MOVED_TABLES = [
     ("library_sections", "id IN (SELECT id FROM mv_sections)"),
     ("section_locations", "library_section_id IN (SELECT id FROM mv_sections)"),
@@ -368,10 +370,32 @@ def hide(cfg, force=False):
 
     DATA.mkdir(parents=True, exist_ok=True)
 
+    # Extras (local featurettes, fetched trailers) carry a NULL library_section_id
+    # and hang off their movie through metadata_relations or parent_id, so a
+    # section-only sweep leaves their rows, media, and bundles behind. Claim the
+    # ones reachable only from items we are moving; an extra any surviving item
+    # still points at stays put, so hiding one library cannot strip a trailer
+    # shared with a library that remains visible. A relation whose owner is NULL
+    # counts as "might be outside" and pins the extra in place: claiming one we
+    # cannot attribute is the only failure here that loses a visible trailer.
+    # Extras with no owner link at all are unattributable and stay behind.
     setup = f"""
 CREATE TEMP TABLE mv_sections AS SELECT id FROM library_sections WHERE id IN ({ids});
 CREATE TEMP TABLE mv_items AS SELECT id FROM metadata_items WHERE library_section_id IN ({ids});
-CREATE TEMP TABLE mv_media AS SELECT id FROM media_items WHERE library_section_id IN ({ids});
+CREATE TEMP TABLE mv_extras AS
+SELECT e.id FROM metadata_items e
+ WHERE e.library_section_id IS NULL
+   AND (e.parent_id IN (SELECT id FROM mv_items)
+        OR (e.parent_id IS NULL
+            AND e.id IN (SELECT related_metadata_item_id FROM metadata_relations
+                          WHERE metadata_item_id IN (SELECT id FROM mv_items))))
+   AND NOT EXISTS (SELECT 1 FROM metadata_relations r
+                    WHERE r.related_metadata_item_id = e.id
+                      AND (r.metadata_item_id IS NULL
+                           OR r.metadata_item_id NOT IN (SELECT id FROM mv_items)));
+INSERT INTO mv_items SELECT id FROM mv_extras;
+CREATE TEMP TABLE mv_media AS SELECT id FROM media_items
+ WHERE library_section_id IN ({ids}) OR metadata_item_id IN (SELECT id FROM mv_items);
 CREATE TEMP TABLE mv_parts AS SELECT id FROM media_parts WHERE media_item_id IN (SELECT id FROM mv_media);
 CREATE TEMP TABLE mv_streams AS SELECT id FROM media_streams WHERE media_item_id IN (SELECT id FROM mv_media);
 CREATE TEMP TABLE mv_clusters AS SELECT id FROM metadata_item_clusters WHERE library_section_id IN ({ids});
@@ -423,10 +447,14 @@ CREATE TEMP TABLE mv_clusters AS SELECT id FROM metadata_item_clusters WHERE lib
         parts.append(
             f"INSERT INTO attic.plexcurtain_sections VALUES ({sid}, '{safe}', '{now}');\n"
         )
+    # report the claim from the script itself; mv_extras is exact, whereas
+    # counting section-less rows in the attic afterwards would also sweep up
+    # playlists and would silently drift if hide ever became incremental
+    parts.append("SELECT 'plexcurtain-extras=' || (SELECT COUNT(*) FROM mv_extras);\n")
     parts.append("COMMIT;\n")
 
     try:
-        sql(DB, "".join(parts))
+        out = sql(DB, "".join(parts))
     except RuntimeError as e:
         print(f"SQL failed, restoring backup: {e}", file=sys.stderr)
         shutil.copy2(backup, DB)
@@ -434,14 +462,24 @@ CREATE TEMP TABLE mv_clusters AS SELECT id FROM metadata_item_clusters WHERE lib
             start_pms()
         die("hide failed; database restored from backup, nothing hidden")
 
-    moved, missing_bundles = move_bundles_out()
-    if was_running:
-        start_pms()
+    # the DB transaction has committed; from here Plex must come back up no
+    # matter what the filesystem does, or the server is left down and hidden
+    try:
+        moved, missing_bundles = move_bundles_out()
+    finally:
+        if was_running:
+            start_pms()
     trim_backups(cfg["keep_backups"])
-    print(
-        f"hidden: {', '.join(name for _, name in found)} "
-        f"({len(moved)} artwork bundles atticked, {missing_bundles} had none)"
-    )
+    m = re.search(r"plexcurtain-extras=(\d+)", out)
+    n_extras = int(m.group(1)) if m else 0
+    summary = f"{len(moved)} artwork bundles atticked"
+    if n_extras:
+        summary += f", {n_extras} section-less extras taken with their owners"
+    print(f"hidden: {', '.join(name for _, name in found)} ({summary})")
+    # fetched trailers are keyed by a remote guid and have no bundle on disk, so
+    # a high "no bundle" count is normal once extras are in the manifest
+    if missing_bundles:
+        print(f"note: {missing_bundles} records had no bundle on disk (normal for fetched extras)")
     if was_running and poke_clients():
         print("poked clients to re-fetch the library list")
 
@@ -549,7 +587,7 @@ def restore(cfg, force=False):
     parts.append("COMMIT;\nVACUUM attic;\n")
 
     try:
-        sql(DB, "".join(parts))
+        out = sql(DB, "".join(parts))
     except RuntimeError as e:
         print(f"SQL failed, restoring backup: {e}", file=sys.stderr)
         shutil.copy2(backup, DB)
@@ -557,9 +595,11 @@ def restore(cfg, force=False):
             start_pms()
         die("restore failed; database rolled back to backup, attic left intact")
 
-    n = move_bundles_back()
-    if was_running:
-        start_pms()
+    try:
+        n = move_bundles_back()
+    finally:
+        if was_running:
+            start_pms()
     trim_backups(cfg["keep_backups"])
     print(
         f"restored: {', '.join(name for _, name, _ in hidden)} ({n} artwork bundles back)"

@@ -96,9 +96,53 @@ def fake_hash(seed):
     return hashlib.sha1(f"plexcurtain-test-{seed}".encode()).hexdigest()
 
 
+def clone_media_chain(db, item, section_expr, seed, hashes):
+    """Clone media_items -> media_parts -> media_streams for `item`.
+
+    `section_expr` is raw SQL ("NULL" for section-less extras, else a section
+    id). Appends the part hash to `hashes` so setUp builds it a bundle."""
+    media = clone_rows(db, "media_items", "id = (SELECT min(id) FROM media_items)",
+                       {"metadata_item_id": str(item), "library_section_id": section_expr})
+    h = fake_hash("part-" + seed)
+    hashes.append(h)
+    part = clone_rows(db, "media_parts", "id = (SELECT min(id) FROM media_parts)",
+                      {"media_item_id": str(media), "hash": f"'{h}'",
+                       "file": f"'/nonexistent/{fake_hash(seed)[:8]}.mkv'"})
+    clone_rows(db, "media_streams", "id = (SELECT min(id) FROM media_streams)",
+               {"media_item_id": str(media), "media_part_id": str(part)})
+    return h
+
+
+def make_extra(db, seed, owners, hashes):
+    """Clone a section-less extra (metadata_type 12) owned by `owners`.
+
+    Mirrors how Plex stores featurettes and fetched trailers: no
+    library_section_id, no parent_id, reachable only through
+    metadata_relations. Returns (item_id, media_part_hash)."""
+    item = clone_rows(db, "metadata_items",
+                      "id = (SELECT min(id) FROM metadata_items WHERE metadata_type = 1)", {
+                          "library_section_id": "NULL",
+                          "parent_id": "NULL",
+                          "metadata_type": "12",
+                          "guid": f"'local://curtain-extra-{fake_hash(seed)[:12]}'",
+                          "title": f"'Curtain Test Extra {seed}'",
+                          "title_sort": f"'curtain test extra {seed}'",
+                          "hash": f"'{fake_hash('extra-' + seed)}'",
+                      })
+    clone_media_chain(db, item, "NULL", "extra-" + seed, hashes)
+    for owner in owners:
+        psql(db, "INSERT INTO metadata_relations "
+                 "(metadata_item_id, related_metadata_item_id, relation_type, created_at) "
+                 f"VALUES ({owner}, {item}, 1, datetime('now'));")
+    return item, hashes[-1]
+
+
 def build_fixture(db):
-    """Add two fake sections with cloned content; return their media hashes."""
+    """Add two fake sections with cloned content plus section-less extras.
+
+    Returns (media hashes needing bundles, extras info)."""
     hashes = []
+    first_item = {}
     tag_id = clone_rows(db, "tags", "id = (SELECT min(id) FROM tags)",
                         {"tag": "'Curtain Test Tag'"})
     for name in (ALPHA, BETA):
@@ -130,24 +174,8 @@ def build_fixture(db):
                 "title_sort": f"'curtain test {seed}'",
                 "hash": f"'{fake_hash('item-' + seed)}'",
             })
-            media = clone_rows(
-                db, "media_items",
-                "id = (SELECT min(id) FROM media_items)",
-                {"metadata_item_id": str(item), "library_section_id": str(sec)},
-            )
-            h = fake_hash("part-" + seed)
-            hashes.append(h)
-            part = clone_rows(
-                db, "media_parts",
-                "id = (SELECT min(id) FROM media_parts)",
-                {"media_item_id": str(media), "hash": f"'{h}'",
-                 "file": f"'/nonexistent/{fake_hash(seed)[:8]}.mkv'"},
-            )
-            clone_rows(
-                db, "media_streams",
-                "id = (SELECT min(id) FROM media_streams)",
-                {"media_item_id": str(media), "media_part_id": str(part)},
-            )
+            clone_media_chain(db, item, str(sec), seed, hashes)
+            first_item.setdefault(name, item)
             psql(db, f"INSERT INTO taggings (metadata_item_id, tag_id, \"index\", created_at) "
                      f"VALUES ({item}, {tag_id}, 0, datetime('now'));")
             # guid-keyed watch state; must survive hide untouched
@@ -157,7 +185,19 @@ def build_fixture(db):
                 {"guid": f"'local://curtain-test-{fake_hash(seed)[:12]}'",
                  "view_count": "7"},
             )
-    return hashes
+    # an extra owned solely by a hidden section: must travel with it
+    owned_id, owned_hash = make_extra(db, "owned", [first_item[ALPHA]], hashes)
+    # an extra a permanently visible library also points at: must stay put
+    outside = one(db, "SELECT min(mi.id) FROM metadata_items mi JOIN library_sections ls "
+                      f"ON ls.id = mi.library_section_id WHERE ls.name NOT IN ('{ALPHA}', '{BETA}');")
+    if not outside:
+        raise unittest.SkipTest("library has no items outside the fixture sections")
+    shared_id, shared_hash = make_extra(db, "shared", [first_item[BETA], outside], hashes)
+    extras = {
+        "owned_id": owned_id, "owned_hash": owned_hash,
+        "shared_id": shared_id, "shared_hash": shared_hash,
+    }
+    return hashes, extras
 
 
 def snapshot(db):
@@ -181,7 +221,7 @@ class PlexcurtainTests(unittest.TestCase):
         cls.master = Path(tempfile.mkdtemp(prefix="plexcurtain-master-"))
         cls.master_db = cls.master / "master.db"
         shutil.copyfile(LIVE_DB, cls.master_db)
-        cls.hashes = build_fixture(cls.master_db)
+        cls.hashes, cls.extras = build_fixture(cls.master_db)
 
     @classmethod
     def tearDownClass(cls):
@@ -198,7 +238,7 @@ class PlexcurtainTests(unittest.TestCase):
             shutil.copyfile(self.master_db, self.db)
         self.media = self.pms / "Media/localhost"
         for h in self.hashes:
-            bundle = self.media / h[0] / (h[1:] + ".bundle/Contents/Thumbnails")
+            bundle = self.bundle_path(h) / "Contents/Thumbnails"
             bundle.mkdir(parents=True)
             (bundle / "thumb1.jpg").write_bytes(b"fake-jpeg-" + h.encode())
         (self.pms / "Metadata/Movies").mkdir(parents=True)
@@ -234,6 +274,9 @@ class PlexcurtainTests(unittest.TestCase):
     def section_names(self):
         return {r[0] for r in rows(self.db, "SELECT name FROM library_sections;")}
 
+    def bundle_path(self, h):
+        return self.media / h[0] / (h[1:] + ".bundle")
+
     # ------------------------------------------------------------ core
 
     def test_round_trip_is_byte_identical(self):
@@ -255,8 +298,13 @@ class PlexcurtainTests(unittest.TestCase):
                    "AND NOT EXISTS (SELECT 1 FROM library_sections ls WHERE ls.id = mi.library_section_id)")
         fake_items = (f"SELECT count(*) FROM metadata_items WHERE library_section_id IN "
                       f"(SELECT id FROM library_sections WHERE name IN ('{ALPHA}', '{BETA}'))")
+        # the section-less extra owned only by ALPHA travels with it by design;
+        # every other item outside the two fake sections must be untouched
+        claimed = f"SELECT count(*) FROM metadata_items WHERE id = {self.extras['owned_id']}"
         orphans_before = one(self.db, orphans)
-        others_before = int(one(self.db, "SELECT count(*) FROM metadata_items")) - int(one(self.db, fake_items))
+        others_before = (int(one(self.db, "SELECT count(*) FROM metadata_items"))
+                         - int(one(self.db, fake_items))
+                         - int(one(self.db, claimed)))
         self.assertEqual(one(self.db, fake_items), "4")
         self.run_tool("hide")
         self.assertEqual(one(self.db, orphans), orphans_before,
@@ -296,7 +344,7 @@ class PlexcurtainTests(unittest.TestCase):
 
     def test_bundles_move_to_attic_and_back(self):
         h = self.hashes[0]
-        bundle = self.media / h[0] / (h[1:] + ".bundle")
+        bundle = self.bundle_path(h)
         attic_bundle = self.data / "bundles/Media/localhost" / h[0] / (h[1:] + ".bundle")
         self.assertTrue(bundle.is_dir())
         self.run_tool("hide")
@@ -305,6 +353,66 @@ class PlexcurtainTests(unittest.TestCase):
         self.run_tool("restore")
         self.assertTrue((bundle / "Contents/Thumbnails/thumb1.jpg").is_file())
         self.assertFalse((self.data / "bundles").exists())
+
+    # ------------------------------------------------------------ extras
+
+    def item_exists(self, item_id):
+        return one(self.db, f"SELECT count(*) FROM metadata_items WHERE id = {item_id};") == "1"
+
+    def test_owned_extra_is_hidden_and_restored(self):
+        owned = self.extras["owned_id"]
+        self.assertTrue(self.item_exists(owned))
+        self.run_tool("hide")
+        self.assertFalse(self.item_exists(owned),
+                         "an extra reachable only from a hidden library must go with it")
+        self.run_tool("restore")
+        self.assertTrue(self.item_exists(owned))
+
+    def test_shared_extra_survives_when_a_visible_owner_remains(self):
+        shared = self.extras["shared_id"]
+        self.run_tool("hide")
+        self.assertTrue(self.item_exists(shared),
+                        "an extra a visible library still points at must stay put")
+        self.run_tool("restore")
+        self.assertTrue(self.item_exists(shared))
+
+    def test_extra_media_rows_travel_with_the_extra(self):
+        owned = self.extras["owned_id"]
+        media_q = f"SELECT count(*) FROM media_items WHERE metadata_item_id = {owned};"
+        self.assertEqual(one(self.db, media_q), "1")
+        self.run_tool("hide")
+        self.assertEqual(one(self.db, media_q), "0",
+                         "section-less media rows must not be left behind")
+        self.run_tool("restore")
+        self.assertEqual(one(self.db, media_q), "1")
+
+    def relations_to(self, item_id):
+        return one(self.db, "SELECT count(*) FROM metadata_relations "
+                            f"WHERE related_metadata_item_id = {item_id};")
+
+    def test_extra_relations_round_trip(self):
+        owned, shared = self.extras["owned_id"], self.extras["shared_id"]
+        self.assertEqual(self.relations_to(owned), "1")
+        self.assertEqual(self.relations_to(shared), "2", "one hidden owner, one visible")
+        self.run_tool("hide")
+        self.assertEqual(self.relations_to(owned), "0",
+                         "a claimed extra's relation must travel with it")
+        self.assertEqual(self.relations_to(shared), "1",
+                         "only the hidden owner's link goes; the visible one stays")
+        self.run_tool("restore")
+        self.assertEqual(self.relations_to(owned), "1")
+        self.assertEqual(self.relations_to(shared), "2",
+                         "the hidden owner's link must come back on restore")
+
+    def test_extra_bundles_follow_ownership(self):
+        owned_b = self.bundle_path(self.extras["owned_hash"])
+        shared_b = self.bundle_path(self.extras["shared_hash"])
+        self.assertTrue(owned_b.is_dir())
+        self.run_tool("hide")
+        self.assertFalse(owned_b.exists(), "hidden extra's bundle must leave the Plex tree")
+        self.assertTrue(shared_b.is_dir(), "visible extra's bundle must stay in place")
+        self.run_tool("restore")
+        self.assertTrue((owned_b / "Contents/Thumbnails/thumb1.jpg").is_file())
 
     def test_gc_tag_resurrected_on_restore(self):
         tag_id = one(self.db, "SELECT id FROM tags WHERE tag = 'Curtain Test Tag'")
